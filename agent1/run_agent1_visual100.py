@@ -35,6 +35,17 @@ def say(message: str) -> None:
     print(f"[{time.strftime('%F %T')}] {message}", flush=True)
 
 
+def load_sample_items() -> list[dict]:
+    items: list[dict] = []
+    with DATA_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                items.append(json.loads(line))
+    if len(items) != 100:
+        raise RuntimeError(f"Expected 100 samples, found {len(items)}")
+    return items
+
+
 def replace_assignment(source: str, name: str, value: str) -> str:
     pattern = re.compile(rf"(?m)^(?P<indent>\s*){re.escape(name)}\s*=.*$")
     replacement = lambda match: f'{match.group("indent")}{name} = {value!r}'
@@ -46,18 +57,12 @@ def replace_assignment(source: str, name: str, value: str) -> str:
 
 def load_expected_names() -> list[str]:
     names: list[str] = []
-    with DATA_PATH.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            name = item.get("image") or item.get("image_name") or item.get("filename")
-            if name:
-                names.append(Path(str(name)).name)
-                continue
-            names.append(
-                f"{item['domain']}_{item['dimension']}_{item['id']}.png"
-            )
+    for item in load_sample_items():
+        name = item.get("image") or item.get("image_name") or item.get("filename")
+        if name:
+            names.append(Path(str(name)).name)
+            continue
+        names.append(f"{item['domain']}_{item['dimension']}_{item['id']}.png")
     if len(names) != 100 or len(set(names)) != 100:
         raise RuntimeError(
             f"Expected 100 unique samples, found {len(names)} rows / {len(set(names))} names"
@@ -98,13 +103,33 @@ def patch_agent() -> None:
     )
 
 
-def prepare_runtime_scripts(result_root: Path) -> dict[str, Path]:
+def prepare_runtime_workers(
+    result_root: Path, gpu_ids: list[str]
+) -> list[dict[str, object]]:
     runtime_dir = result_root / "runtime"
+    shard_dir = result_root / "shards"
     edited_dir = result_root / "edited"
     plan_root = result_root / "plans"
     runtime_dir.mkdir(parents=True, exist_ok=True)
+    shard_dir.mkdir(parents=True, exist_ok=True)
 
-    scripts: dict[str, Path] = {}
+    workers_per_dimension = len(gpu_ids) // len(DIMENSIONS)
+    grouped: dict[str, list[dict]] = {dimension: [] for dimension in DIMENSIONS}
+    for item in load_sample_items():
+        dimension = item.get("dimension")
+        if dimension not in grouped:
+            raise RuntimeError(f"Unexpected dimension in sample100: {dimension!r}")
+        grouped[dimension].append(item)
+    bad_counts = {
+        dimension: len(items)
+        for dimension, items in grouped.items()
+        if len(items) != 25
+    }
+    if bad_counts:
+        raise RuntimeError(f"Expected 25 samples per dimension: {bad_counts}")
+
+    workers: list[dict[str, object]] = []
+    gpu_index = 0
     for dimension in DIMENSIONS:
         source_path = AGENT1_DIR / f"{dimension}.py"
         if not source_path.is_file():
@@ -113,18 +138,49 @@ def prepare_runtime_scripts(result_root: Path) -> dict[str, Path]:
         if "VISUAL_ANCHOR_PROMPT_V2 = True" not in source:
             raise RuntimeError(f"Visual prompt patch is absent from {source_path}")
 
-        source = replace_assignment(source, "DATA_PATH", str(DATA_PATH))
-        source = replace_assignment(source, "OUTPUT_DIR", str(edited_dir))
-        source = replace_assignment(source, "PLAN_DIR", str(plan_root / dimension))
+        for shard_index in range(workers_per_dimension):
+            shard_items = grouped[dimension][shard_index::workers_per_dimension]
+            label = (
+                dimension
+                if workers_per_dimension == 1
+                else f"{dimension}_s{shard_index}"
+            )
+            shard_path = shard_dir / f"{label}.jsonl"
+            shard_path.write_text(
+                "".join(
+                    json.dumps(item, ensure_ascii=False) + "\n"
+                    for item in shard_items
+                ),
+                encoding="utf-8",
+            )
 
-        runtime_path = runtime_dir / f"{dimension}.py"
-        runtime_path.write_text(source, encoding="utf-8")
-        subprocess.run(
-            [sys.executable, "-m", "py_compile", str(runtime_path)], check=True
-        )
-        scripts[dimension] = runtime_path
-        say(f"Prepared {dimension}: {runtime_path}")
-    return scripts
+            runtime_source = replace_assignment(source, "DATA_PATH", str(shard_path))
+            runtime_source = replace_assignment(
+                runtime_source, "OUTPUT_DIR", str(edited_dir)
+            )
+            runtime_source = replace_assignment(
+                runtime_source, "PLAN_DIR", str(plan_root / dimension)
+            )
+            runtime_path = runtime_dir / f"{label}.py"
+            runtime_path.write_text(runtime_source, encoding="utf-8")
+            subprocess.run(
+                [sys.executable, "-m", "py_compile", str(runtime_path)], check=True
+            )
+            worker = {
+                "label": label,
+                "dimension": dimension,
+                "shard": shard_index,
+                "sample_count": len(shard_items),
+                "gpu": gpu_ids[gpu_index],
+                "script": runtime_path,
+            }
+            workers.append(worker)
+            gpu_index += 1
+            say(
+                f"Prepared {label}: GPU={worker['gpu']} "
+                f"samples={len(shard_items)} script={runtime_path}"
+            )
+    return workers
 
 
 def worker_env(gpu: str, token_log: Path) -> dict[str, str]:
@@ -147,13 +203,16 @@ def worker_env(gpu: str, token_log: Path) -> dict[str, str]:
     return env
 
 
-def run_dimension(
-    dimension: str, script: Path, gpu: str, result_root: Path
+def run_worker(
+    worker: dict[str, object], result_root: Path
 ) -> tuple[str, int, float]:
-    log_path = result_root / "logs" / f"{dimension}.log"
-    token_log = result_root / "tokens" / f"{dimension}.jsonl"
+    label = str(worker["label"])
+    gpu = str(worker["gpu"])
+    script = Path(worker["script"])
+    log_path = result_root / "logs" / f"{label}.log"
+    token_log = result_root / "tokens" / f"{label}.jsonl"
     started = time.monotonic()
-    say(f"START {dimension} GPU={gpu}; log={log_path}")
+    say(f"START {label} GPU={gpu}; log={log_path}")
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n===== start {time.strftime('%F %T')} GPU={gpu} =====\n")
         log.flush()
@@ -165,26 +224,27 @@ def run_dimension(
             stderr=subprocess.STDOUT,
         )
     elapsed = time.monotonic() - started
-    say(f"EXIT {dimension} code={process.returncode} seconds={elapsed:.1f}")
-    return dimension, process.returncode, elapsed
+    say(f"EXIT {label} code={process.returncode} seconds={elapsed:.1f}")
+    return label, process.returncode, elapsed
 
 
 def run_generation(
-    scripts: dict[str, Path], gpu_ids: list[str], result_root: Path
+    workers: list[dict[str, object]], result_root: Path
 ) -> dict[str, dict[str, float | int | str]]:
-    gpu_map = dict(zip(DIMENSIONS, gpu_ids, strict=True))
     status: dict[str, dict[str, float | int | str]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(workers)) as executor:
         futures = {
-            executor.submit(
-                run_dimension, dimension, scripts[dimension], gpu_map[dimension], result_root
-            ): dimension
-            for dimension in DIMENSIONS
+            executor.submit(run_worker, worker, result_root): worker
+            for worker in workers
         }
         for future in concurrent.futures.as_completed(futures):
-            dimension, returncode, elapsed = future.result()
-            status[dimension] = {
-                "gpu": gpu_map[dimension],
+            label, returncode, elapsed = future.result()
+            worker = futures[future]
+            status[label] = {
+                "dimension": str(worker["dimension"]),
+                "shard": int(worker["shard"]),
+                "sample_count": int(worker["sample_count"]),
+                "gpu": str(worker["gpu"]),
                 "returncode": returncode,
                 "wall_seconds": round(elapsed, 3),
             }
@@ -353,8 +413,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--gpus",
-        default="0,2,3,4",
-        help="Four unique GPU IDs for text,knowledge,attribute,layout",
+        default="0,1,2,3,4,5,6,7",
+        help="Four or eight unique GPU IDs. Eight GPUs create two shards per dimension.",
     )
     parser.add_argument(
         "--result-name",
@@ -374,8 +434,8 @@ def main() -> None:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.result_name):
         raise SystemExit("--result-name must be one simple directory name")
     gpu_ids = [part.strip() for part in args.gpus.split(",") if part.strip()]
-    if len(gpu_ids) != 4 or len(set(gpu_ids)) != 4:
-        raise SystemExit("--gpus must contain four unique GPU IDs")
+    if len(gpu_ids) not in {4, 8} or len(set(gpu_ids)) != len(gpu_ids):
+        raise SystemExit("--gpus must contain four or eight unique GPU IDs")
 
     required = [DATA_PATH, REPO_ROOT, AGENT1_DIR]
     missing = [str(path) for path in required if not path.exists()]
@@ -412,8 +472,8 @@ def main() -> None:
 
     if args.apply_patch and not args.skip_patch:
         patch_agent()
-    scripts = prepare_runtime_scripts(result_root)
-    status = run_generation(scripts, gpu_ids, result_root)
+    workers = prepare_runtime_workers(result_root, gpu_ids)
+    status = run_generation(workers, result_root)
     failed = {
         name: info
         for name, info in status.items()
