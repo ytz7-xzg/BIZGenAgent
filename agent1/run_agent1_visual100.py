@@ -104,6 +104,15 @@ def prepare_runtime_scripts(result_root: Path) -> dict[str, Path]:
     plan_root = result_root / "plans"
     runtime_dir.mkdir(parents=True, exist_ok=True)
 
+    shared_helper = AGENT1_DIR / "repair_visual_utils.py"
+    if not shared_helper.is_file():
+        raise FileNotFoundError(shared_helper)
+    runtime_helper = runtime_dir / shared_helper.name
+    shutil.copy2(shared_helper, runtime_helper)
+    subprocess.run(
+        [sys.executable, "-m", "py_compile", str(runtime_helper)], check=True
+    )
+
     scripts: dict[str, Path] = {}
     for dimension in DIMENSIONS:
         source_path = AGENT1_DIR / f"{dimension}.py"

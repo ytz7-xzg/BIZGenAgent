@@ -22,6 +22,7 @@ from diffusers import QwenImageEditPlusPipeline
 from google import genai
 from google.genai import types
 from gemini_meter import metered_generate_content
+from repair_visual_utils import make_marked_crop, prepare_round_artifacts, recover_with_multistage, save_image, save_json
 
 # ================== 配置（要改就改这里） ==================
 LIMIT = None
@@ -37,6 +38,7 @@ IMG_DIR = "/mmu-vcg/zb08/zixuan/BIZ/results/sample100/originals"
 MARK_DIR = "/mmu-vcg/zb08/zixuan/BIZ/results/sample100/mark_original"
 OUTPUT_DIR = os.environ.get("BIZ_OUTPUT_DIR", "/mmu-vcg/zb08/zixuan/BIZ/results/agent1_repair/edited")
 PLAN_DIR = os.environ.get("BIZ_PLAN_DIR", "/mmu-vcg/zb08/zixuan/BIZ/results/agent1_repair/plans/text")
+INTERMEDIATE_DIR = os.path.join(PLAN_DIR, "intermediates")
 
 EDIT_PIPE_PATH = "/mmu-vcg/zb08/CKPTS/qwen-edit_2511"
 
@@ -53,6 +55,7 @@ VERIFY_CONFIDENCE = 0.65
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(PLAN_DIR, exist_ok=True)
+os.makedirs(INTERMEDIATE_DIR, exist_ok=True)
 
 if os.path.exists(KEY_PATH):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = KEY_PATH
@@ -170,23 +173,25 @@ def compose_qwen_prompt(e):
     )
 
 
-def gemini_crop_instruction(region_img, edit, retries=3):
+def gemini_crop_instruction(region_img, marked_img, edit, retries=3):
     """Let Gemini inspect only the crop and write the instruction Qwen will see."""
     buf = io.BytesIO()
-    region_img.save(buf, format="PNG")
+    marked_img.save(buf, format="PNG")
     prompt = f"""Inspect only the attached cropped image.
 
 The incorrect visible text is: {edit['current_content']}
 The exact replacement text is: {edit['correct_content']}
 
-Write one very short image-editing instruction for this crop.
+The magenta rectangle marks the target. Write one very short instruction for editing IMAGE 1; IMAGE 2 will be this marked reference.
 Rules:
-- Identify the text only by characters or appearance visible in this crop.
+- Begin with: Edit image 1 only; image 2 marks the target.
+- Identify the marked text using its exact visible characters plus at most one appearance cue.
 - State exactly one replacement action and preserve the exact replacement characters.
 - Do not mention bbox, coordinates, row/column numbers, ordering in the full image, or anything outside this crop.
 - Do not include analysis or grounding explanations.
 - End with: Keep everything else unchanged.
-- Return STRICT JSON only: {{"instruction": "..."}}"""
+- Refine the target rectangle in crop-local normalized xyxy coordinates.
+- Return STRICT JSON only: {{"instruction": "...", "target_bbox": [x1, y1, x2, y2]}}"""
 
     for attempt in range(retries):
         try:
@@ -202,13 +207,18 @@ Rules:
             match = re.search(r"\{.*\}", raw, re.DOTALL)
             if not match:
                 raise ValueError("no JSON object in crop-instruction response")
-            instruction = clean_field(json.loads(match.group()).get("instruction"))
+            payload = json.loads(match.group())
+            instruction = clean_field(payload.get("instruction"))
+            refined_bbox = normalize_bbox(payload.get("target_bbox", []))
             if not instruction:
                 raise ValueError("empty crop instruction")
-            return instruction
+            prefix = "Edit image 1 only; image 2 marks the target."
+            if not instruction.lower().startswith(prefix.lower()):
+                instruction = f"{prefix} {instruction}"
+            return instruction, refined_bbox
         except Exception as ex:
             print(f"  [CROP PROMPT retry {attempt+1}/{retries}] {str(ex)[:120]}")
-    return compose_qwen_prompt(edit)
+    return "Edit image 1 only; image 2 marks the target. " + compose_qwen_prompt(edit), None
 
 
 def gemini_plan(image_source, prompt, failed_questions, applied_history=None,
@@ -399,10 +409,10 @@ def paste_feathered(bg, fg, box, feather=FEATHER):
     return bg
 
 
-def edit_region(pipe, region_img, qwen_prompt, seed):
+def edit_region(pipe, region_img, qwen_prompt, seed, marked_img=None):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     inputs = {
-        "image": [region_img],
+        "image": [region_img, marked_img] if marked_img is not None else [region_img],
         "prompt": qwen_prompt,
         "generator": generator,
         "true_cfg_scale": 4.0,
@@ -412,7 +422,17 @@ def edit_region(pipe, region_img, qwen_prompt, seed):
         "num_images_per_prompt": 1,
     }
     with torch.inference_mode():
-        output = pipe(**inputs)
+        try:
+            output = pipe(**inputs)
+        except (TypeError, ValueError) as ex:
+            if marked_img is None or not any(word in str(ex).lower() for word in ("image", "list", "input")):
+                raise
+            inputs["image"] = [region_img]
+            inputs["prompt"] = qwen_prompt.replace(
+                "Edit image 1 only; image 2 marks the target.",
+                "Edit only the precisely described target.",
+            )
+            output = pipe(**inputs)
     return extract_image(output)
 
 
@@ -501,6 +521,54 @@ def save_verification_json(fname, index, info):
     with open(verify_path, "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
     return verify_path
+
+
+def try_multistage_recovery(pipe, before_full, clean_crop, marked_crop,
+                            rejected_crop, crop_box, edit, failed_questions,
+                            original_prompt, round_directory, seed_base):
+    """Try a transactional multi-stage route after a rejected single edit."""
+    route, stages_ok, rebuilt_crop, stage_records = recover_with_multistage(
+        client=client,
+        model=GEMINI_MODEL,
+        token_log=os.environ["GEMINI_TOKEN_LOG"],
+        clean_crop=clean_crop,
+        marked_crop=marked_crop,
+        rejected_crop=rejected_crop,
+        edit_summary=edit.get("qwen_prompt", edit.get("instruction", "")),
+        verifier_reason=edit.get("_last_rejection_reason", ""),
+        round_directory=round_directory,
+        seed_base=seed_base,
+        edit_callback=lambda work, marker, instruction, seed: edit_region(
+            pipe, work, instruction, seed, marked_img=marker
+        ),
+    )
+    if not stages_ok:
+        return False, None, {
+            "route": route,
+            "stages": stage_records,
+            "accepted": False,
+        }
+
+    rebuilt_full = paste_feathered(
+        before_full.copy(), rebuilt_crop.convert("RGB"), crop_box
+    )
+    save_image(round_directory, "multistage_candidate_full.png", rebuilt_full)
+    routed_edit = dict(edit)
+    routed_edit["qwen_prompt"] = "Multi-stage route: " + " ".join(
+        stage["instruction"] for stage in route["stages"]
+    )
+    accepted, verification = verify_candidate(
+        before_full, rebuilt_full, original_prompt, routed_edit, failed_questions
+    )
+    result = {
+        "route": route,
+        "stages": stage_records,
+        "final_verification": verification,
+        "accepted": accepted,
+    }
+    save_json(round_directory, "multistage_result.json", result)
+    return accepted, rebuilt_full if accepted else None, result
+
 
 
 def main():
@@ -594,21 +662,32 @@ def main():
                 if region.size[0] < 32 or region.size[1] < 32:
                     print("  [STOP] 区域太小")
                     break
-                e["qwen_prompt"] = gemini_crop_instruction(region, e)
+                before = img.copy()
+                round_dir, marked_region = prepare_round_artifacts(
+                    INTERMEDIATE_DIR, fname, round_idx, before, region, box, e["bbox"]
+                )
+                e["qwen_prompt"], refined_bbox = gemini_crop_instruction(region, marked_region, e)
+                if refined_bbox is not None:
+                    marked_region = make_marked_crop(region, refined_bbox)
+                save_image(round_dir, "marked_crop.png", marked_region)
+                save_json(round_dir, "refined_target.json", {"target_bbox_in_crop": refined_bbox})
                 print(f"  [QWEN PROMPT] {e['qwen_prompt']}")
                 save_plan_json(
                     fname, it, img_path, save_path, failed, plan_info,
                     round_idx, e, len(edits), list(applied_history),
                 )
-                before = img.copy()
                 fixed = edit_region(
-                    pipe, region, e["qwen_prompt"], SEED + i * 100 + round_idx
+                    pipe, region, e["qwen_prompt"], SEED + i * 100 + round_idx,
+                    marked_img=marked_region,
                 )
+                save_image(round_dir, "qwen_output_crop.png", fixed)
                 candidate = paste_feathered(before.copy(), fixed.convert("RGB"), box)
+                save_image(round_dir, "candidate_full.png", candidate)
                 accepted, verify_info = verify_candidate(
                     before, candidate, it.get("prompt", ""), e, failed
                 )
                 verify_info["qwen_prompt"] = e["qwen_prompt"]
+                save_json(round_dir, "single_verification.json", verify_info)
                 verify_path = save_verification_json(fname, round_idx, verify_info)
                 print(f"  [VERIFY] {verify_info['status']} | {verify_path}")
                 if accepted:
@@ -618,9 +697,32 @@ def main():
                         f"Round {round_idx}: {e['current_content']} -> {e['correct_content']}"
                     )
                     rejection_counts.pop(issue_key, None)
+                    save_image(round_dir, "committed_full.png", img)
+                    save_json(round_dir, "round_status.json", {"status": "accepted_single"})
                     continue
 
                 reason = str(verify_info.get("reason", "no verifier reason"))
+                e["_last_rejection_reason"] = reason
+                multi_accepted, multi_candidate, multi_info = try_multistage_recovery(
+                    pipe, before, region, marked_region, fixed.convert("RGB"), box,
+                    e, failed, it.get("prompt", ""), round_dir,
+                    SEED + i * 1000 + round_idx * 10,
+                )
+                if multi_accepted:
+                    img = multi_candidate
+                    accepted_edits += 1
+                    applied_history.append(
+                        f"Round {round_idx}: multi-stage {e['current_content']} -> {e['correct_content']}"
+                    )
+                    rejection_counts.pop(issue_key, None)
+                    save_image(round_dir, "committed_full.png", img)
+                    save_json(round_dir, "round_status.json", {"status": "accepted_multistage"})
+                    continue
+                save_json(round_dir, "round_status.json", {
+                    "status": "rejected", "reason": reason,
+                    "route": multi_info.get("route", {}),
+                })
+                save_image(round_dir, "rollback_full.png", before)
                 rejection_counts[issue_key] = rejection_counts.get(issue_key, 0) + 1
                 reject_count = rejection_counts[issue_key]
                 rejection_history.append(
