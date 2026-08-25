@@ -28,7 +28,8 @@ SEED = 42
 SKIP_EXISTING = True
 TARGET_DIMENSION = "knowledge"
 VISUAL_ANCHOR_PROMPT_V2 = True
-MAX_EDITS_PER_IMAGE = 10
+MAX_KNOWLEDGE_ROUNDS = 10
+MAX_REJECTIONS_PER_ISSUE = 3
 
 DATA_PATH = "/mmu-vcg/zb08/zixuan/BIZ/results/sample100/sample100.jsonl"
 IMG_DIR = "/mmu-vcg/zb08/zixuan/BIZ/results/sample100/originals"
@@ -74,6 +75,16 @@ def extract_image(output, depth=0):
     if isinstance(output, (list, tuple)) and len(output) > 0:
         return extract_image(output[0], depth + 1)
     return output
+
+
+def image_to_bytes(image_source):
+    """支持路径或 PIL Image；多轮规划时始终发送最新工作图。"""
+    if isinstance(image_source, (str, os.PathLike)):
+        with open(image_source, "rb") as f:
+            return f.read()
+    buf = io.BytesIO()
+    image_source.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def normalize_bbox(raw_bbox):
@@ -201,10 +212,26 @@ Rules:
     return compose_qwen_prompt(edit)
 
 
-def gemini_plan(img_path, prompt, failed_questions, retries=3):
-    """Gemini 看图 + knowledge 失败问题 → 返回结构化知识修正计划。"""
+def gemini_plan(image_source, prompt, failed_questions, applied_history=None,
+                blocked_checks=None, rejection_history=None, retries=3):
+    """Gemini 看最新工作图，自主发现下一处知识问题。"""
+    applied_history = applied_history or []
+    blocked_checks = blocked_checks or set()
+    rejection_history = rejection_history or []
+    history_text = "\n".join(f"- {x}" for x in applied_history) or "None."
+    blocked_text = "\n".join(f"- {x}" for x in sorted(blocked_checks)) or "None."
+    rejection_text = "\n".join(f"- {x}" for x in rejection_history[-6:]) or "None."
     planner_prompt = f"""This image was generated from the prompt:
 \"\"\"{prompt}\"\"\"
+
+Edits already accepted in previous rounds:
+{history_text}
+
+Issues blocked after repeated rejected candidates:
+{blocked_text}
+
+Recent rejected candidates and verifier reasons:
+{rejection_text}
 
 Independently inspect the image against the original generation prompt.
 Discover visible factual or knowledge discrepancies yourself; do not assume an evaluator has identified them for you.
@@ -225,7 +252,7 @@ Return STRICT JSON (no markdown, no explanation), a list:
 }}]
 
 VISUAL GROUNDING RULES:
-- failed_check MUST describe one knowledge discrepancy independently discovered from the image and original prompt.
+- failed_check MUST describe one knowledge discrepancy independently discovered from the image and original prompt. Never select an issue shown in the blocked list.
 - visual_signature MUST identify the target by how it looks NOW inside the crop. Use 2-4 observable cues such as object type, current color/shape, unique attached text or number, and a nearby local relationship.
 - Do NOT rely only on a semantic category name, legend label, series name, or an ordinal such as "third from the left". Those labels or orders may already be wrong.
 - instruction MUST be one atomic action on the visually identified target. Use "it" or "its" instead of repeating an unreliable semantic name.
@@ -238,11 +265,12 @@ Rules:
 - bbox: normalized [0,1] coordinates tightly around the visual element whose knowledge content is wrong or missing.
 - instruction: a short direct command stating EXACTLY what the corrected content should be,
   e.g. "Change the formula to '2H2O2 -> 2H2O + O2'" or "Replace the label with 'manganese dioxide'".
+- Put the single safest edit FIRST. The pipeline applies only that edit and then replans from the updated image.
+- If no visible knowledge discrepancy remains, return an empty list: [].
 - One atomic action per round. Never merge color, height, size, text, or position changes.
 - Knowledge corrections only, no layout changes."""
 
-    with open(img_path, "rb") as f:
-        img_bytes = f.read()
+    img_bytes = image_to_bytes(image_source)
 
     attempts = []
     for attempt in range(retries):
@@ -321,8 +349,11 @@ Rules:
     }
 
 
-def save_plan_json(fname, it, img_path, save_path, failed, plan_info):
-    plan_path = os.path.join(PLAN_DIR, fname.replace(".png", ".json"))
+def save_plan_json(fname, it, img_path, save_path, failed, plan_info,
+                   round_idx, selected_edit, planned_count, applied_history):
+    plan_path = os.path.join(
+        PLAN_DIR, fname.replace(".png", f"_round{round_idx}.json")
+    )
     record = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "file_name": fname,
@@ -333,6 +364,10 @@ def save_plan_json(fname, it, img_path, save_path, failed, plan_info):
         "output_image": save_path,
         "original_prompt": it.get("prompt", ""),
         "failed_questions": failed,
+        "round": round_idx,
+        "selected_edit": selected_edit,
+        "planned_edit_count": planned_count,
+        "applied_history_before_round": applied_history,
         **plan_info,
     }
     with open(plan_path, "w", encoding="utf-8") as f:
@@ -523,51 +558,80 @@ def main():
             continue
 
         print(f"[{i+1}/{len(todo)}] {fname}  失败题数={len(failed)}")
-        img = None
+        img = Image.open(img_path).convert("RGB")
         accepted_edits = 0
+        applied_history = []
+        rejection_counts = {}
+        blocked_checks = set()
+        rejection_history = []
         try:
-            edits, plan_info = gemini_plan(img_path, it.get("prompt", ""), failed)
-            plan_path = save_plan_json(fname, it, img_path, save_path, failed, plan_info)
-            print(f"  [PLAN JSON] {plan_path}")
+            for round_idx in range(1, MAX_KNOWLEDGE_ROUNDS + 1):
+                print(f"  [ROUND {round_idx}/{MAX_KNOWLEDGE_ROUNDS}] Gemini 基于当前图重新规划")
+                edits, plan_info = gemini_plan(
+                    img, it.get("prompt", ""), failed,
+                    applied_history=applied_history,
+                    blocked_checks=blocked_checks,
+                    rejection_history=rejection_history,
+                )
+                selected_edit = edits[0] if edits else None
+                plan_path = save_plan_json(
+                    fname, it, img_path, save_path, failed, plan_info,
+                    round_idx, selected_edit, len(edits) if edits else 0,
+                    list(applied_history),
+                )
+                print(f"  [PLAN JSON] {plan_path}")
+                if edits is None:
+                    print("  [STOP] Gemini 请求失败")
+                    break
+                if len(edits) == 0:
+                    print("  [STOP] Gemini 判断当前图没有剩余 knowledge 问题")
+                    break
 
-            if edits is None:
-                print("  [FAIL] Gemini 请求失败")
-                n_fail += 1
-                continue
-            if len(edits) == 0:
-                print("  [SKIP] Gemini 判断当前图没有剩余 knowledge 问题")
-                n_skip += 1
-                continue
-            print(f"  [PLAN] {len(edits)} 处编辑")
-
-            img = Image.open(img_path).convert("RGB")
-            accepted_edits = 0
-            for j, e in enumerate(edits[:MAX_EDITS_PER_IMAGE]):
+                e = edits[0]
+                issue_key = f"{e['knowledge_type']} | {e['current_content']} -> {e['correct_content']}"
+                if issue_key in blocked_checks:
+                    print(f"  [SKIP ISSUE] 已连续拒绝 {MAX_REJECTIONS_PER_ISSUE} 次：{issue_key[:120]}")
+                    continue
                 region, box = crop_region(img, e["bbox"])
                 if region.size[0] < 32 or region.size[1] < 32:
-                    print(f"  [EDIT {j+1}] 区域太小，跳过")
-                    continue
+                    print("  [STOP] 区域太小")
+                    break
                 e["qwen_prompt"] = gemini_crop_instruction(region, e)
                 print(f"  [QWEN PROMPT] {e['qwen_prompt']}")
-                save_plan_json(fname, it, img_path, save_path, failed, plan_info)
-                print(
-                    f"  [EDIT {j+1}] {e['knowledge_type']} | "
-                    f"{e['target_object']} | {e['current_content']} -> {e['correct_content']}"
+                save_plan_json(
+                    fname, it, img_path, save_path, failed, plan_info,
+                    round_idx, e, len(edits), list(applied_history),
                 )
                 before = img.copy()
-                fixed = edit_region(pipe, region, e["qwen_prompt"], SEED + i * 100 + j)
+                fixed = edit_region(
+                    pipe, region, e["qwen_prompt"], SEED + i * 100 + round_idx
+                )
                 candidate = paste_feathered(before.copy(), fixed.convert("RGB"), box)
                 accepted, verify_info = verify_candidate(
                     before, candidate, it.get("prompt", ""), e, failed
                 )
                 verify_info["qwen_prompt"] = e["qwen_prompt"]
-                verify_path = save_verification_json(fname, j + 1, verify_info)
+                verify_path = save_verification_json(fname, round_idx, verify_info)
                 print(f"  [VERIFY] {verify_info['status']} | {verify_path}")
                 if accepted:
                     img = candidate
                     accepted_edits += 1
-                else:
-                    print("  [ROLLBACK-LOCAL] 当前候选被拒绝，保留此前通过的工作图，继续下一问题")
+                    applied_history.append(
+                        f"Round {round_idx}: {e['current_content']} -> {e['correct_content']}"
+                    )
+                    rejection_counts.pop(issue_key, None)
+                    continue
+
+                reason = str(verify_info.get("reason", "no verifier reason"))
+                rejection_counts[issue_key] = rejection_counts.get(issue_key, 0) + 1
+                reject_count = rejection_counts[issue_key]
+                rejection_history.append(
+                    f"{issue_key} | attempt={reject_count} | reason={reason}"
+                )
+                print(f"  [ROLLBACK-LOCAL] 保留上一成功版本 ({reject_count}/{MAX_REJECTIONS_PER_ISSUE})")
+                if reject_count >= MAX_REJECTIONS_PER_ISSUE:
+                    blocked_checks.add(issue_key)
+                    print(f"  [SKIP ISSUE] 本问题已屏蔽：{issue_key[:120]}")
 
             if accepted_edits > 0:
                 img.save(save_path)
