@@ -252,3 +252,92 @@ def recover_with_multistage(client, model, token_log, clean_crop, marked_crop,
         ),
     )
     return route, success, output, records
+
+
+class SenseNovaEditPipeline:
+    """Qwen-compatible adapter around the official SenseNova-U1.5 editor.
+
+    The four repair workers already share a small pipeline call surface.  This
+    adapter preserves that surface so planning, crop grounding, verification,
+    rollback, resume, assembly, and scoring remain unchanged.
+    """
+
+    def __init__(self, model_path, torch_dtype=None, **_kwargs):
+        import importlib.util
+        import sys
+        import torch
+
+        code_dir = Path(os.environ.get(
+            "SENSENOVA_CODE_DIR",
+            "/mmu-vcg/zb08/zixuan/BIZ/SenseNova-U1",
+        ))
+        inference_path = code_dir / "examples" / "editing" / "inference.py"
+        if not inference_path.is_file():
+            raise FileNotFoundError(
+                f"SenseNova official inference entry not found: {inference_path}"
+            )
+
+        module_name = "_biz_sensenova_editing"
+        module = sys.modules.get(module_name)
+        if module is None:
+            spec = importlib.util.spec_from_file_location(module_name, inference_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load SenseNova inference code: {inference_path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+
+        self.device = "cuda"
+        self.engine = module.SenseNovaU1Editing(
+            model_path=str(model_path),
+            device=self.device,
+            dtype=torch_dtype or torch.bfloat16,
+            vram_mode=os.environ.get("SENSENOVA_VRAM_MODE", "full"),
+        )
+
+    @classmethod
+    def from_pretrained(cls, model_path, **kwargs):
+        return cls(model_path, **kwargs)
+
+    def to(self, device):
+        self.device = str(device)
+        return self
+
+    def __call__(
+        self,
+        *,
+        image,
+        prompt,
+        generator=None,
+        true_cfg_scale=4.0,
+        num_inference_steps=40,
+        num_images_per_prompt=1,
+        **_kwargs,
+    ):
+        from types import SimpleNamespace
+
+        images = list(image) if isinstance(image, (list, tuple)) else [image]
+        images = [img.convert("RGB") for img in images if img is not None]
+        if not images:
+            raise ValueError("SenseNovaEditPipeline requires at least one input image")
+
+        # SenseNova requires both output axes to be divisible by 32.
+        width, height = images[0].size
+        width = max(32, ((width + 31) // 32) * 32)
+        height = max(32, ((height + 31) // 32) * 32)
+        seed = int(generator.initial_seed()) if generator is not None else 0
+
+        outputs, _thinking = self.engine.edit(
+            prompt=prompt,
+            images=images,
+            image_size=(width, height),
+            cfg_scale=float(true_cfg_scale),
+            img_cfg_scale=float(os.environ.get("SENSENOVA_IMG_CFG_SCALE", "1.0")),
+            cfg_norm=os.environ.get("SENSENOVA_CFG_NORM", "none"),
+            timestep_shift=float(os.environ.get("SENSENOVA_TIMESTEP_SHIFT", "3.0")),
+            num_steps=int(num_inference_steps),
+            batch_size=int(num_images_per_prompt),
+            think_mode=False,
+            seed=seed,
+        )
+        return SimpleNamespace(images=outputs)
