@@ -27,7 +27,10 @@ from datetime import datetime
 import numpy as np
 from PIL import Image, ImageFilter
 import torch
-from diffusers import QwenImageEditPlusPipeline
+if os.environ.get("BIZ_EDIT_BACKEND", "qwen").lower() == "sensenova":
+    from repair_visual_utils import SenseNovaEditPipeline as QwenImageEditPlusPipeline
+else:
+    from diffusers import QwenImageEditPlusPipeline
 from google import genai
 from google.genai import types
 from gemini_meter import metered_generate_content
@@ -48,7 +51,7 @@ OUTPUT_DIR = os.environ.get("BIZ_OUTPUT_DIR", "/mmu-vcg/zb08/zixuan/BIZ/results/
 PLAN_DIR = os.environ.get("BIZ_PLAN_DIR", "/mmu-vcg/zb08/zixuan/BIZ/results/agent1_repair/plans/attribute")
 INTERMEDIATE_DIR = os.path.join(PLAN_DIR, "intermediates")
 
-EDIT_PIPE_PATH = "/mmu-vcg/zb08/CKPTS/qwen-edit_2511"
+EDIT_PIPE_PATH = os.environ.get("BIZ_EDIT_MODEL_PATH", "/mmu-vcg/zb08/CKPTS/qwen-edit_2511")
 
 KEY_PATH = "/mmu-vcg/zb08/llm-6669-1b56d4a3712d.json"
 GEMINI_MODEL = "gemini-3-flash-preview"
