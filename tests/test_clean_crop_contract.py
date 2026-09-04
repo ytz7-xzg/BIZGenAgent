@@ -45,6 +45,14 @@ class CleanCropContractTest(unittest.TestCase):
             self.assertIn("MIN_REGION_PAD_PX", source)
             self.assertIn("MAX_REGION_PAD", source)
 
+    def test_text_heavy_crops_have_reversible_orientation(self):
+        for name in ("text", "knowledge"):
+            source = (ROOT / "agent1" / f"{name}.py").read_text(encoding="utf-8")
+            self.assertIn('"crop_rotation": crop_rotation', source)
+            self.assertIn("def orient_crop_for_editor", source)
+            self.assertIn("def restore_crop_orientation", source)
+            self.assertIn("editor_region = orient_crop_for_editor", source)
+
 
 if __name__ == "__main__":
     unittest.main()
