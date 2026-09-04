@@ -22,7 +22,9 @@ from pathlib import Path
 
 
 BIZ_ROOT = Path("/mmu-vcg/zb08/zixuan/BIZ")
-AGENT1_DIR = BIZ_ROOT / "agents/agent1_repair"
+# Run the exact code checked out from this repository.  Data and result paths
+# remain under BIZ_ROOT, but no second mutable source copy is required.
+AGENT1_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = BIZ_ROOT / "tools"
 SAMPLE_ROOT = BIZ_ROOT / "results/sample100"
 DATA_PATH = SAMPLE_ROOT / "sample100.jsonl"
