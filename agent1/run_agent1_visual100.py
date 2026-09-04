@@ -92,6 +92,11 @@ def prepare_runtime_scripts(result_root: Path) -> dict[str, Path]:
     plan_root = result_root / "plans"
     runtime_dir.mkdir(parents=True, exist_ok=True)
 
+    backend_source = AGENT1_DIR / "editor_backend.py"
+    if not backend_source.is_file():
+        raise FileNotFoundError(backend_source)
+    shutil.copy2(backend_source, runtime_dir / backend_source.name)
+
     scripts: dict[str, Path] = {}
     for dimension in DIMENSIONS:
         source_path = AGENT1_DIR / f"{dimension}.py"
@@ -125,6 +130,7 @@ def worker_env(gpu: str, token_log: Path) -> dict[str, str]:
         f"{TOOLS_DIR}:{current_pythonpath}" if current_pythonpath else str(TOOLS_DIR)
     )
     env["GEMINI_TOKEN_LOG"] = str(token_log)
+    env.setdefault("BIZ_EDITOR_BACKEND", "sensenova")
     env.setdefault(
         "GOOGLE_APPLICATION_CREDENTIALS",
         "/mmu-vcg/zb08/llm-6669-1b56d4a3712d.json",
