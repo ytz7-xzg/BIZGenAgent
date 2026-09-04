@@ -24,7 +24,6 @@ from pathlib import Path
 BIZ_ROOT = Path("/mmu-vcg/zb08/zixuan/BIZ")
 AGENT1_DIR = BIZ_ROOT / "agents/agent1_repair"
 TOOLS_DIR = BIZ_ROOT / "tools"
-PATCH_SCRIPT = TOOLS_DIR / "patch_agent1_visual_prompts.py"
 SAMPLE_ROOT = BIZ_ROOT / "results/sample100"
 DATA_PATH = SAMPLE_ROOT / "sample100.jsonl"
 REPO_ROOT = Path("/mmu-vcg/zb08/wps4.28/7-25-BizGen/BizGenEval")
@@ -85,33 +84,11 @@ def find_original_dir(names: list[str]) -> Path:
     )
 
 
-def patch_agent() -> None:
-    if not PATCH_SCRIPT.is_file():
-        raise FileNotFoundError(
-            f"Missing {PATCH_SCRIPT}; copy patch_agent1_visual_prompts.py there first"
-        )
-    say("Patching all four Agent1 dimensions with visual-anchor prompts")
-    subprocess.run(
-        [sys.executable, str(PATCH_SCRIPT), "--agent1-dir", str(AGENT1_DIR)],
-        cwd=str(BIZ_ROOT),
-        check=True,
-    )
-
-
 def prepare_runtime_scripts(result_root: Path) -> dict[str, Path]:
     runtime_dir = result_root / "runtime"
     edited_dir = result_root / "edited"
     plan_root = result_root / "plans"
     runtime_dir.mkdir(parents=True, exist_ok=True)
-
-    shared_helper = AGENT1_DIR / "repair_visual_utils.py"
-    if not shared_helper.is_file():
-        raise FileNotFoundError(shared_helper)
-    runtime_helper = runtime_dir / shared_helper.name
-    shutil.copy2(shared_helper, runtime_helper)
-    subprocess.run(
-        [sys.executable, "-m", "py_compile", str(runtime_helper)], check=True
-    )
 
     scripts: dict[str, Path] = {}
     for dimension in DIMENSIONS:
@@ -119,8 +96,8 @@ def prepare_runtime_scripts(result_root: Path) -> dict[str, Path]:
         if not source_path.is_file():
             raise FileNotFoundError(source_path)
         source = source_path.read_text(encoding="utf-8")
-        if "VISUAL_ANCHOR_PROMPT_V2 = True" not in source:
-            raise RuntimeError(f"Visual prompt patch is absent from {source_path}")
+        if "CLEAN_CROP_PROMPT_V3 = True" not in source:
+            raise RuntimeError(f"Clean-crop prompt pipeline is absent from {source_path}")
 
         source = replace_assignment(source, "DATA_PATH", str(DATA_PATH))
         source = replace_assignment(source, "OUTPUT_DIR", str(edited_dir))
@@ -370,12 +347,6 @@ def main() -> None:
         default="agent1_visual100",
         help="Single directory name created under zixuan/BIZ/results",
     )
-    parser.add_argument(
-        "--apply-patch",
-        action="store_true",
-        help="Explicitly run the legacy visual-prompt patch before generation",
-    )
-    parser.add_argument("--skip-patch", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--generation-only", action="store_true")
     parser.add_argument("--force-score", action="store_true")
     args = parser.parse_args()
@@ -419,8 +390,6 @@ def main() -> None:
     say(f"Original directory: {original_dir}")
     say(f"Result directory: {result_root}")
 
-    if args.apply_patch and not args.skip_patch:
-        patch_agent()
     scripts = prepare_runtime_scripts(result_root)
     status = run_generation(scripts, gpu_ids, result_root)
     failed = {
