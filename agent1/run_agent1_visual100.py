@@ -87,10 +87,29 @@ def find_original_dir(names: list[str]) -> Path:
     )
 
 
-def prepare_case_subset(result_root: Path, cases_per_dimension: int, seed: int) -> Path:
+def load_excluded_names(paths: list[str]) -> set[str]:
+    excluded: set[str] = set()
+    for raw_path in paths:
+        path = Path(raw_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Exclude manifest missing: {path}")
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    excluded.add(item_name(json.loads(line)))
+    return excluded
+
+
+def prepare_case_subset(
+    result_root: Path,
+    cases_per_dimension: int,
+    seed: int,
+    exclude_manifests: list[str] | None = None,
+) -> Path:
     """Select reproducible, actually-failing cases so every worker gets real work."""
     if cases_per_dimension <= 0:
         return DATA_PATH
+    excluded = load_excluded_names(exclude_manifests or [])
     grouped = {dimension: [] for dimension in DIMENSIONS}
     with DATA_PATH.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -101,6 +120,8 @@ def prepare_case_subset(result_root: Path, cases_per_dimension: int, seed: int) 
             if dimension not in grouped:
                 continue
             name = item_name(item)
+            if name in excluded:
+                continue
             mark_path = SAMPLE_ROOT / "mark_original" / name.replace(".png", ".json")
             if not mark_path.is_file():
                 continue
@@ -141,6 +162,8 @@ def prepare_case_subset(result_root: Path, cases_per_dimension: int, seed: int) 
         encoding="utf-8",
     )
     say(f"Selected {len(selected)} cases: {manifest}")
+    if excluded:
+        say(f"Excluded {len(excluded)} previously tested images")
     return manifest
 
 
@@ -456,6 +479,12 @@ def main() -> None:
         help="Use a reproducible eligible subset per dimension; 0 runs the full manifest",
     )
     parser.add_argument("--case-seed", type=int, default=42)
+    parser.add_argument(
+        "--exclude-manifest",
+        action="append",
+        default=[],
+        help="JSONL manifest whose image names must not be sampled; repeatable",
+    )
     args = parser.parse_args()
 
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.result_name):
@@ -497,7 +526,10 @@ def main() -> None:
     all_names = load_expected_names(DATA_PATH)
     original_dir = find_original_dir(all_names)
     active_data_path = prepare_case_subset(
-        result_root, args.cases_per_dimension, args.case_seed
+        result_root,
+        args.cases_per_dimension,
+        args.case_seed,
+        args.exclude_manifest,
     )
     names = load_expected_names(active_data_path)
     say(f"Original directory: {original_dir}")
