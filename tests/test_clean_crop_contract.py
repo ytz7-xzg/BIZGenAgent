@@ -51,6 +51,23 @@ class CleanCropContractTest(unittest.TestCase):
             self.assertIn("MIN_REGION_PAD_PX", source)
             self.assertIn("MAX_REGION_PAD", source)
 
+    def test_crop_prompt_is_mandatory_and_full_image_fallback_is_forbidden(self):
+        for name in DIMENSIONS:
+            source = (ROOT / "agent1" / f"{name}.py").read_text(encoding="utf-8")
+            self.assertIn("gemini_crop_instruction", source)
+            self.assertIn("refusing full-image fallback", source)
+            self.assertNotIn("return compose_editor_prompt(edit)", source)
+
+    def test_paste_is_hard_bounded_with_twelve_pixel_margin(self):
+        forbidden = ("paste_feathered", "ImageFilter", "GaussianBlur", "alpha =")
+        for name in DIMENSIONS:
+            source = (ROOT / "agent1" / f"{name}.py").read_text(encoding="utf-8")
+            self.assertIn("PASTE_MARGIN_PX = 12", source)
+            self.assertIn("def paste_hard_bbox", source)
+            self.assertIn("bg.paste(fg.crop(local)", source)
+            for token in forbidden:
+                self.assertNotIn(token, source, f"{name}: {token}")
+
     def test_text_heavy_crops_have_reversible_orientation(self):
         for name in ("text", "knowledge"):
             source = (ROOT / "agent1" / f"{name}.py").read_text(encoding="utf-8")
@@ -70,6 +87,8 @@ class CleanCropContractTest(unittest.TestCase):
     def test_runner_has_strict_four_case_smoke_mode(self):
         source = (ROOT / "agent1/run_agent1_visual100.py").read_text(encoding="utf-8")
         self.assertIn('"--cases-per-dimension"', source)
+        self.assertIn('"--exclude-manifest"', source)
+        self.assertIn("def load_excluded_names", source)
         self.assertIn("def prepare_case_subset", source)
         self.assertIn("random.Random(seed)", source)
         self.assertIn('value.get("result") is False', source)
