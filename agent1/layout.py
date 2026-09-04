@@ -24,8 +24,7 @@ mark/ 评测 json → 找 layout 维度 result=false 的题
 
 import os, io, json, re
 from datetime import datetime
-import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image
 from google import genai
 from google.genai import types
 from gemini_meter import metered_generate_content
@@ -51,7 +50,7 @@ GEMINI_MODEL = "gemini-3-flash-preview"
 REGION_PAD = 0.15       # bbox 自身宽高的外扩比例
 MAX_REGION_PAD = 0.05   # 单侧最多外扩全图 5%
 MIN_REGION_PAD_PX = 24  # 单侧至少保留 24px 上下文
-FEATHER = 24
+PASTE_MARGIN_PX = 12
 VERIFY_CONFIDENCE = 0.65
 MAX_REJECTIONS_PER_ISSUE = 2
 FULL_IMAGE_AREA_THRESHOLD = 0.90
@@ -201,9 +200,12 @@ Required final layout: {edit['desired_state']}
 Write one concise, crop-local image-editing instruction.
 Rules:
 - Base the instruction only on visual content actually visible in this crop.
+- Rewrite all target descriptions into crop-local visual language; do not copy full-image locators from the planning context.
 - Mention only the source, destination, or guide that is visibly necessary inside the crop.
 - State exactly one layout action.
 - Explicitly preserve: {edit['preserve']}
+- Explicitly name the nearby visible text, lines, blocks, borders, and symbols that must remain fixed.
+- For removal, require complete erasure and reconstruction of the immediately surrounding background, with no ghost, residue, outline, duplicate, replacement character, tiny text, or new mark.
 - Do not mention bbox, coordinates, row/column numbers, ordering in the full image, or anything outside this crop.
 - Do not include analysis or grounding explanations.
 - End with: Keep every other visible element unchanged.
@@ -229,7 +231,7 @@ Rules:
             return instruction
         except Exception as ex:
             print(f"  [CROP PROMPT retry {attempt+1}/{retries}] {str(ex)[:120]}")
-    return compose_editor_prompt(edit)
+    raise RuntimeError("Crop-grounded prompt generation failed; refusing full-image fallback")
 
 
 def gemini_plan(image_source, prompt, failed_questions, blocked_checks=None, rejection_history=None, retries=3):
@@ -424,16 +426,17 @@ def crop_region(img, bbox, pad=REGION_PAD):
     return img.crop(box), box
 
 
-def paste_feathered(bg, fg, box, feather=FEATHER):
-    x1, y1, x2, y2 = box
-    w, h = x2 - x1, y2 - y1
-    fg = fg.resize((w, h))
-    yy, xx = np.mgrid[0:h, 0:w]
-    d = np.minimum(np.minimum(xx, w - 1 - xx), np.minimum(yy, h - 1 - yy)).astype(np.float32)
-    alpha = np.clip(d / feather, 0, 1) * 255
-    mask = Image.fromarray(alpha.astype(np.uint8), "L").filter(
-        ImageFilter.GaussianBlur(feather // 2))
-    bg.paste(fg, (x1, y1), mask)
+def paste_hard_bbox(bg, fg, crop_box, bbox, margin=PASTE_MARGIN_PX):
+    """Hard-paste target bbox plus margin, clamped to the inspected crop."""
+    cx1, cy1, cx2, cy2 = crop_box
+    fg = fg.resize((cx2 - cx1, cy2 - cy1), Image.Resampling.LANCZOS)
+    W, H = bg.size
+    raw = (int(bbox[0] * W), int(bbox[1] * H),
+           int(bbox[2] * W), int(bbox[3] * H))
+    box = (max(cx1, raw[0] - margin), max(cy1, raw[1] - margin),
+           min(cx2, raw[2] + margin), min(cy2, raw[3] + margin))
+    local = (box[0] - cx1, box[1] - cy1, box[2] - cx1, box[3] - cy1)
+    bg.paste(fg.crop(local), (box[0], box[1]))
     return bg
 
 
@@ -630,7 +633,11 @@ def main():
                     print("  [STOP] 选中区域太小，停止当前图片")
                     break
 
-                e["editor_prompt"] = gemini_crop_instruction(region, e)
+                try:
+                    e["editor_prompt"] = gemini_crop_instruction(region, e)
+                except RuntimeError as ex:
+                    print(f"  [STOP] {ex}")
+                    break
                 print(f"  [EDITOR PROMPT] {e['editor_prompt']}")
                 save_plan_json(
                     fname, it, img_path, save_path, failed,
@@ -644,7 +651,9 @@ def main():
                     SEED + i * 100 + round_idx,
                 )
                 before = img.copy()
-                candidate = paste_feathered(before.copy(), fixed.convert("RGB"), box)
+                candidate = paste_hard_bbox(
+                    before.copy(), fixed.convert("RGB"), box, e["edit_bbox"]
+                )
                 accepted, verify_info = verify_candidate(
                     before, candidate, it.get("prompt", ""), e, failed
                 )
@@ -690,7 +699,6 @@ def main():
             else:
                 n_fail += 1
 
-        torch.cuda.empty_cache()
 
     print(f"\n[DONE] 成功 {n_done} / 跳过 {n_skip} / 失败 {n_fail}")
     print(f"[INFO] 输出目录：{OUTPUT_DIR}")
