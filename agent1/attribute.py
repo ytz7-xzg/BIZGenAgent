@@ -5,7 +5,7 @@ Boogu-Turbo attribute 维度修复流水线（迭代版，改编自 bizgen_attri
 
 核心逻辑：
 1. 每轮只修改一个 attribute 问题（优先级最高的那处）。
-2. Qwen 修改后，让 Gemini 基于新图重新规划下一处。
+2. SenseNova 修改后，让 Gemini 基于新图重新规划下一处。
 3. Gemini 会看到之前已经完成的修改，避免重复修改同一位置。
 4. 每张图最多 10 轮；如果 Gemini 判断没有剩余问题，会提前停止。
 
@@ -26,11 +26,10 @@ import os, io, json, re
 from datetime import datetime
 import numpy as np
 from PIL import Image, ImageFilter
-import torch
-from diffusers import QwenImageEditPlusPipeline
 from google import genai
 from google.genai import types
 from gemini_meter import metered_generate_content
+from editor_backend import create_editor
 
 # ================== 配置（要改就改这里） ==================
 LIMIT = None
@@ -46,15 +45,12 @@ MARK_DIR = "/mmu-vcg/zb08/zixuan/BIZ/results/sample100/mark_original"
 OUTPUT_DIR = os.environ.get("BIZ_OUTPUT_DIR", "/mmu-vcg/zb08/zixuan/BIZ/results/agent1_repair/edited")
 PLAN_DIR = os.environ.get("BIZ_PLAN_DIR", "/mmu-vcg/zb08/zixuan/BIZ/results/agent1_repair/plans/attribute")
 
-EDIT_PIPE_PATH = "/mmu-vcg/zb08/CKPTS/qwen-edit_2511"
-
 KEY_PATH = "/mmu-vcg/zb08/llm-6669-1b56d4a3712d.json"
 GEMINI_MODEL = "gemini-3-flash-preview"
 
 REGION_PAD = 0.15       # bbox 自身宽高的外扩比例
 MAX_REGION_PAD = 0.05   # 单侧最多外扩全图 5%
 MIN_REGION_PAD_PX = 24  # 单侧至少保留 24px 上下文
-EDIT_STEPS = 40
 FEATHER = 24
 VERIFY_CONFIDENCE = 0.65
 MAX_REJECTIONS_PER_ISSUE = 2
@@ -71,20 +67,6 @@ if os.path.exists(KEY_PATH):
 else:
     client = genai.Client()
     print("[INFO] Gemini 使用 GEMINI_API_KEY")
-
-
-def extract_image(output, depth=0):
-    if depth > 5:
-        return output
-    if hasattr(output, "save"):
-        return output
-    if hasattr(output, "images"):
-        imgs = output.images
-        if isinstance(imgs, (list, tuple)) and len(imgs) > 0:
-            return extract_image(imgs[0], depth + 1)
-    if isinstance(output, (list, tuple)) and len(output) > 0:
-        return extract_image(output[0], depth + 1)
-    return output
 
 
 def image_to_bytes(image_source):
@@ -173,7 +155,7 @@ def normalize_edit(e):
 
 
 
-def compose_qwen_prompt(e):
+def compose_editor_prompt(e):
     """Deterministic fallback when crop-level Gemini prompting is unavailable."""
     return (
         f"Change only the visible target from {e['current_state']} to {e['desired_state']}. "
@@ -222,7 +204,7 @@ Rules:
             return instruction
         except Exception as ex:
             print(f"  [CROP PROMPT retry {attempt+1}/{retries}] {str(ex)[:120]}")
-    return compose_qwen_prompt(edit)
+    return compose_editor_prompt(edit)
 
 
 def gemini_plan(image_source, prompt, failed_questions, applied_history=None, blocked_checks=None, rejection_history=None, retries=3):
@@ -279,7 +261,7 @@ VISUAL GROUNDING RULES:
 - instruction MUST be one atomic action on the visually identified target. Use "it" or "its" instead of repeating an unreliable semantic name.
 - Do not combine independent actions. For example, changing a bar color and changing its height are two rounds. Return the single safest action first; the next round will inspect the updated image again.
 - reference_context names the visible guide needed to perform the action. For a measured position or size, name the exact axis tick, gridline, edge, or neighboring object.
-- bbox MUST include the complete target, all cues named in visual_signature, and the visible reference_context. Everything needed by Qwen must be visible in this one crop.
+- bbox MUST include the complete target, all cues named in visual_signature, and the visible reference_context. Everything needed by the editor must be visible in this one crop.
 - preserve MUST explicitly name the target properties and nearby content that must stay unchanged, excluding only the property changed by this action.
 
 Precision rules:
@@ -431,21 +413,8 @@ def paste_feathered(bg, fg, box, feather=FEATHER):
     return bg
 
 
-def edit_region(pipe, region_img, qwen_prompt, seed):
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    inputs = {
-        "image": [region_img],
-        "prompt": qwen_prompt,
-        "generator": generator,
-        "true_cfg_scale": 4.0,
-        "negative_prompt": "unrelated changes, duplicated elements, missing content, distortion, broken borders, broken gridlines, visible seams, redesigned image",
-        "num_inference_steps": EDIT_STEPS,
-        "guidance_scale": 1.0,
-        "num_images_per_prompt": 1,
-    }
-    with torch.inference_mode():
-        output = pipe(**inputs)
-    return extract_image(output)
+def edit_region(editor, region_img, editor_prompt, seed):
+    return editor.edit(region_img, editor_prompt, seed)
 
 
 def _pil_png_bytes(img):
@@ -456,7 +425,7 @@ def _pil_png_bytes(img):
 
 def verify_candidate(before_img, after_img, original_prompt, edit, failed_questions, retries=2):
     """比较编辑前后；只检查目标是否改善以及是否误伤无关内容。"""
-    target_instruction = edit.get("qwen_prompt", edit.get("instruction", ""))
+    target_instruction = edit.get("editor_prompt", edit.get("instruction", ""))
     verifier_prompt = f"""You are checking one local edit in a business image.
 
 Original generation prompt:
@@ -572,11 +541,9 @@ def main():
         return
 
     # 3. 加载编辑模型
-    print("[LOAD] Loading Qwen-Image-Edit-2511 ...")
-    pipe = QwenImageEditPlusPipeline.from_pretrained(
-        EDIT_PIPE_PATH, torch_dtype=torch.bfloat16, trust_remote_code=True,
-    ).to("cuda")
-    print("[LOAD] done.")
+    print("[LOAD] Loading configured editor backend ...")
+    pipe = create_editor()
+    print(f"[LOAD] {pipe.name} ready; steps={pipe.steps}.")
 
     # 4. 逐图处理：每轮只改一处，然后基于新图重新规划
     n_done, n_skip, n_fail = 0, 0, 0
@@ -643,8 +610,8 @@ def main():
                     print("  [STOP] 选中区域太小，停止当前图片")
                     break
 
-                e["qwen_prompt"] = gemini_crop_instruction(region, e)
-                print(f"  [QWEN PROMPT] {e['qwen_prompt']}")
+                e["editor_prompt"] = gemini_crop_instruction(region, e)
+                print(f"  [EDITOR PROMPT] {e['editor_prompt']}")
                 save_plan_json(
                     fname, it, img_path, save_path, failed,
                     plan_info, round_idx, e, len(edits), list(applied_history),
@@ -653,7 +620,7 @@ def main():
                 fixed = edit_region(
                     pipe,
                     region,
-                    e["qwen_prompt"],
+                    e["editor_prompt"],
                     SEED + i * 100 + round_idx,
                 )
                 before = img.copy()
@@ -661,7 +628,7 @@ def main():
                 accepted, verify_info = verify_candidate(
                     before, candidate, it.get("prompt", ""), e, failed
                 )
-                verify_info["qwen_prompt"] = e["qwen_prompt"]
+                verify_info["editor_prompt"] = e["editor_prompt"]
                 verify_path = save_verification_json(fname, round_idx, verify_info)
                 print(f"  [VERIFY] {verify_info['status']} | {verify_path}")
                 if not accepted:
