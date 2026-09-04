@@ -67,6 +67,14 @@ class CleanCropContractTest(unittest.TestCase):
         self.assertIn("SENSE_TARGET_PIXELS = 3456 * 1152", source)
         self.assertIn("[model_input]", source)
 
+    def test_runner_has_strict_four_case_smoke_mode(self):
+        source = (ROOT / "agent1/run_agent1_visual100.py").read_text(encoding="utf-8")
+        self.assertIn('"--cases-per-dimension"', source)
+        self.assertIn("def prepare_case_subset", source)
+        self.assertIn("random.Random(seed)", source)
+        self.assertIn('value.get("result") is False', source)
+        self.assertIn("active_data_path", source)
+
     def test_sensenova_adapter_uses_tested_size_and_settings(self):
         calls = {}
 
