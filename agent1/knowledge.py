@@ -144,6 +144,9 @@ def normalize_edit(e):
     if bb is None or not instruction:
         return None
     target_object = clean_field(e.get("target_object"), "target content")
+    crop_rotation = clean_field(e.get("crop_rotation"), "none").lower()
+    if crop_rotation not in {"none", "clockwise_90", "counterclockwise_90"}:
+        crop_rotation = "none"
     return {
         "knowledge_type": clean_field(e.get("knowledge_type"), "other"),
         "target_object": target_object,
@@ -158,6 +161,7 @@ def normalize_edit(e):
         "correct_content": clean_field(e.get("correct_content")),
         "correction_reason": clean_field(e.get("correction_reason"), "The visible content does not match the original prompt."),
         "bbox": bb,
+        "crop_rotation": crop_rotation,
         "instruction": instruction,
     }
 
@@ -251,6 +255,7 @@ Return STRICT JSON (no markdown, no explanation), a list:
   "correct_content": "exact required final content",
   "correction_reason": "why the replacement is factually correct",
   "bbox": [x1, y1, x2, y2],
+  "crop_rotation": "none | clockwise_90 | counterclockwise_90",
   "instruction": "one exact correction command"
 }}]
 
@@ -262,6 +267,7 @@ VISUAL GROUNDING RULES:
 - Do not combine independent actions. For example, changing a bar color and changing its height are two rounds. Return the single safest action first; the next round will inspect the updated image again.
 - reference_context names the visible guide needed to perform the action. For a measured position or size, name the exact axis tick, gridline, edge, or neighboring object.
 - bbox MUST include the complete target, all cues named in visual_signature, and the visible reference_context. Everything needed by Qwen must be visible in this one crop.
+- crop_rotation is the rotation applied before editing to make text-heavy content horizontal and left-to-right. Use clockwise_90 for bottom-to-top vertical content, counterclockwise_90 for top-to-bottom vertical content, and none otherwise.
 - preserve MUST explicitly name the target properties and nearby content that must stay unchanged, excluding only the property changed by this action.
 
 Rules:
@@ -389,6 +395,22 @@ def crop_region(img, bbox, pad=REGION_PAD):
     x2 = min(1.0, bbox[2] + pad_x); y2 = min(1.0, bbox[3] + pad_y)
     box = (int(x1 * W), int(y1 * H), int(x2 * W), int(y2 * H))
     return img.crop(box), box
+
+
+def orient_crop_for_editor(crop, crop_rotation):
+    if crop_rotation == "clockwise_90":
+        return crop.transpose(Image.Transpose.ROTATE_270)
+    if crop_rotation == "counterclockwise_90":
+        return crop.transpose(Image.Transpose.ROTATE_90)
+    return crop
+
+
+def restore_crop_orientation(crop, crop_rotation):
+    if crop_rotation == "clockwise_90":
+        return crop.transpose(Image.Transpose.ROTATE_90)
+    if crop_rotation == "counterclockwise_90":
+        return crop.transpose(Image.Transpose.ROTATE_270)
+    return crop
 
 
 def paste_feathered(bg, fg, box, feather=FEATHER):
@@ -599,7 +621,8 @@ def main():
                 if region.size[0] < 32 or region.size[1] < 32:
                     print("  [STOP] 区域太小")
                     break
-                e["qwen_prompt"] = gemini_crop_instruction(region, e)
+                editor_region = orient_crop_for_editor(region, e["crop_rotation"])
+                e["qwen_prompt"] = gemini_crop_instruction(editor_region, e)
                 print(f"  [QWEN PROMPT] {e['qwen_prompt']}")
                 save_plan_json(
                     fname, it, img_path, save_path, failed, plan_info,
@@ -607,8 +630,9 @@ def main():
                 )
                 before = img.copy()
                 fixed = edit_region(
-                    pipe, region, e["qwen_prompt"], SEED + i * 100 + round_idx
+                    pipe, editor_region, e["qwen_prompt"], SEED + i * 100 + round_idx
                 )
+                fixed = restore_crop_orientation(fixed.convert("RGB"), e["crop_rotation"])
                 candidate = paste_feathered(before.copy(), fixed.convert("RGB"), box)
                 accepted, verify_info = verify_candidate(
                     before, candidate, it.get("prompt", ""), e, failed
