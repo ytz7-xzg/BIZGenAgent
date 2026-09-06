@@ -65,8 +65,10 @@ class CleanCropContractTest(unittest.TestCase):
             self.assertIn("def paste_hard_bbox", source)
             if name in ("text", "knowledge"):
                 self.assertIn("PASTE_FEATHER_PX = 2", source)
+                self.assertIn("PASTE_EDGE_ALPHA = 224", source)
                 self.assertIn("def paste_light_feather", source)
-                self.assertIn("ImageFilter.GaussianBlur(radius=feather)", source)
+                self.assertIn('Image.new("L", patch.size, edge_alpha)', source)
+                self.assertIn("ImageFilter.GaussianBlur", source)
                 self.assertIn("bg.paste(patch, (box[0], box[1]), mask)", source)
                 self.assertNotIn("paste_difference_mask", source)
                 self.assertNotIn("DIFF_THRESHOLD", source)

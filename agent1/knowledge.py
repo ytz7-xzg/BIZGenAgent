@@ -43,6 +43,7 @@ MAX_REGION_PAD = 0.05   # 单侧最多外扩全图 5%
 MIN_REGION_PAD_PX = 24  # 单侧至少保留 24px 上下文
 PASTE_MARGIN_PX = 12
 PASTE_FEATHER_PX = 2
+PASTE_EDGE_ALPHA = 224
 EMPTY_PLAN_CONFIRMATIONS = 2
 VERIFY_CONFIDENCE = 0.65             # 贴回时的羽化像素
 # =========================================================
@@ -416,7 +417,8 @@ def paste_hard_bbox(bg, fg, crop_box, bbox, margin=PASTE_MARGIN_PX):
 
 
 def paste_light_feather(bg, edited_crop, crop_box, bbox,
-                        margin=PASTE_MARGIN_PX, feather=PASTE_FEATHER_PX):
+                        margin=PASTE_MARGIN_PX, feather=PASTE_FEATHER_PX,
+                        edge_alpha=PASTE_EDGE_ALPHA):
     """Paste the edited region at full strength with only a tiny edge blend."""
     cx1, cy1, cx2, cy2 = crop_box
     size = (cx2 - cx1, cy2 - cy1)
@@ -428,10 +430,10 @@ def paste_light_feather(bg, edited_crop, crop_box, bbox,
     local = (box[0] - cx1, box[1] - cy1, box[2] - cx1, box[3] - cy1)
     patch = edited.crop(local)
     feather = max(1, min(feather, (min(patch.size) - 1) // 2))
-    mask = Image.new("L", patch.size, 0)
+    mask = Image.new("L", patch.size, edge_alpha)
     ImageDraw.Draw(mask).rectangle((feather, feather, patch.width - feather - 1,
                                     patch.height - feather - 1), fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=feather))
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=max(0.5, feather / 2)))
     bg.paste(patch, (box[0], box[1]), mask)
     return bg
 
