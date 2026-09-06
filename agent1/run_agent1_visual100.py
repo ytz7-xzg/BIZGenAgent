@@ -100,6 +100,52 @@ def load_excluded_names(paths: list[str]) -> set[str]:
     return excluded
 
 
+def prepare_named_subset(result_root: Path, requested_names: list[str]) -> Path:
+    """Write an exact manifest for explicitly requested image filenames."""
+    requested = []
+    seen: set[str] = set()
+    for raw_name in requested_names:
+        name = Path(raw_name).name
+        if name in seen:
+            raise ValueError(f"Duplicate --case-name: {name}")
+        seen.add(name)
+        requested.append(name)
+
+    available: dict[str, dict] = {}
+    with DATA_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                item = json.loads(line)
+                available[item_name(item)] = item
+
+    missing = [name for name in requested if name not in available]
+    if missing:
+        raise FileNotFoundError(
+            "Requested cases are absent from the canonical manifest: "
+            + ", ".join(missing)
+        )
+    selected = [available[name] for name in requested]
+    manifest = result_root / "cases_named.jsonl"
+    manifest.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in selected),
+        encoding="utf-8",
+    )
+    (result_root / "selected_cases.json").write_text(
+        json.dumps(
+            [
+                {"dimension": item["dimension"], "image": item_name(item)}
+                for item in selected
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    say(f"Selected {len(selected)} explicitly named cases: {manifest}")
+    return manifest
+
+
 def prepare_case_subset(
     result_root: Path,
     cases_per_dimension: int,
@@ -480,6 +526,12 @@ def main() -> None:
     )
     parser.add_argument("--case-seed", type=int, default=42)
     parser.add_argument(
+        "--case-name",
+        action="append",
+        default=[],
+        help="Run one exact image filename from the canonical manifest; repeatable",
+    )
+    parser.add_argument(
         "--exclude-manifest",
         action="append",
         default=[],
@@ -494,6 +546,8 @@ def main() -> None:
         raise SystemExit("--gpus must contain four unique GPU IDs")
     if args.cases_per_dimension < 0:
         raise SystemExit("--cases-per-dimension must be non-negative")
+    if args.case_name and args.cases_per_dimension:
+        raise SystemExit("--case-name cannot be combined with --cases-per-dimension")
 
     required = [DATA_PATH, REPO_ROOT, AGENT1_DIR]
     missing = [str(path) for path in required if not path.exists()]
@@ -525,12 +579,15 @@ def main() -> None:
 
     all_names = load_expected_names(DATA_PATH)
     original_dir = find_original_dir(all_names)
-    active_data_path = prepare_case_subset(
-        result_root,
-        args.cases_per_dimension,
-        args.case_seed,
-        args.exclude_manifest,
-    )
+    if args.case_name:
+        active_data_path = prepare_named_subset(result_root, args.case_name)
+    else:
+        active_data_path = prepare_case_subset(
+            result_root,
+            args.cases_per_dimension,
+            args.case_seed,
+            args.exclude_manifest,
+        )
     names = load_expected_names(active_data_path)
     say(f"Original directory: {original_dir}")
     say(f"Result directory: {result_root}")
