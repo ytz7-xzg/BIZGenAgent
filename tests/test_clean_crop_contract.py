@@ -58,21 +58,28 @@ class CleanCropContractTest(unittest.TestCase):
             self.assertIn("refusing full-image fallback", source)
             self.assertNotIn("return compose_editor_prompt(edit)", source)
 
-    def test_paste_is_hard_bounded_with_twelve_pixel_margin(self):
-        forbidden = ("paste_feathered", "ImageFilter", "GaussianBlur", "alpha =")
+    def test_paste_is_bounded_with_twelve_pixel_margin(self):
         for name in DIMENSIONS:
             source = (ROOT / "agent1" / f"{name}.py").read_text(encoding="utf-8")
             self.assertIn("PASTE_MARGIN_PX = 12", source)
             self.assertIn("def paste_hard_bbox", source)
             if name in ("text", "knowledge"):
-                self.assertIn("def paste_difference_mask", source)
-                self.assertIn("DIFF_THRESHOLD = 12", source)
-                self.assertIn('"difference_mask.png"', source)
-                self.assertIn("candidate, difference_mask = paste_difference_mask", source)
+                self.assertIn("PASTE_FEATHER_PX = 2", source)
+                self.assertIn("def paste_light_feather", source)
+                self.assertIn("ImageFilter.GaussianBlur(radius=feather)", source)
+                self.assertIn("bg.paste(patch, (box[0], box[1]), mask)", source)
+                self.assertNotIn("paste_difference_mask", source)
+                self.assertNotIn("DIFF_THRESHOLD", source)
+                self.assertNotIn('"difference_mask.png"', source)
             else:
                 self.assertIn("bg.paste(fg.crop(local)", source)
-            for token in forbidden:
-                self.assertNotIn(token, source, f"{name}: {token}")
+
+    def test_empty_plan_requires_two_confirmations(self):
+        for name in ("text", "knowledge"):
+            source = (ROOT / "agent1" / f"{name}.py").read_text(encoding="utf-8")
+            self.assertIn("EMPTY_PLAN_CONFIRMATIONS = 2", source)
+            self.assertIn("empty_plan_count += 1", source)
+            self.assertIn("empty_plan_count = 0", source)
 
     def test_all_dimensions_allow_twenty_five_rounds(self):
         constants = {

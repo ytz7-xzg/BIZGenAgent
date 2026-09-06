@@ -14,9 +14,8 @@ Boogu-Turbo text 维度修复流水线（knowledge 版的结构化方法）
 """
 
 import os, io, json, re
-import numpy as np
 from datetime import datetime
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 from google import genai
 from google.genai import types
 from gemini_meter import metered_generate_content
@@ -44,8 +43,8 @@ REGION_PAD = 0.15       # bbox 自身宽高的外扩比例
 MAX_REGION_PAD = 0.05   # 单侧最多外扩全图 5%
 MIN_REGION_PAD_PX = 24  # 单侧至少保留 24px 上下文
 PASTE_MARGIN_PX = 12
-DIFF_THRESHOLD = 12
-DIFF_DILATION_PX = 1
+PASTE_FEATHER_PX = 2
+EMPTY_PLAN_CONFIRMATIONS = 2
 VERIFY_CONFIDENCE = 0.65
 # =========================================================
 
@@ -414,42 +413,25 @@ def paste_hard_bbox(bg, fg, crop_box, bbox, margin=PASTE_MARGIN_PX):
     return bg
 
 
-def paste_difference_mask(bg, original_crop, edited_crop, crop_box, bbox,
-                          margin=PASTE_MARGIN_PX, threshold=DIFF_THRESHOLD):
-    """Paste semantic pixel changes only; preserve the original crop background."""
+def paste_light_feather(bg, edited_crop, crop_box, bbox,
+                        margin=PASTE_MARGIN_PX, feather=PASTE_FEATHER_PX):
+    """Paste the edited region at full strength with only a tiny edge blend."""
     cx1, cy1, cx2, cy2 = crop_box
     size = (cx2 - cx1, cy2 - cy1)
-    original = np.asarray(original_crop.resize(size, Image.Resampling.LANCZOS).convert("RGB"), dtype=np.float32)
-    edited = np.asarray(edited_crop.resize(size, Image.Resampling.LANCZOS).convert("RGB"), dtype=np.float32)
-    h, w = original.shape[:2]
+    edited = edited_crop.resize(size, Image.Resampling.LANCZOS).convert("RGB")
     W, H = bg.size
     raw = (int(bbox[0] * W), int(bbox[1] * H), int(bbox[2] * W), int(bbox[3] * H))
     box = (max(cx1, raw[0] - margin), max(cy1, raw[1] - margin),
            min(cx2, raw[2] + margin), min(cy2, raw[3] + margin))
     local = (box[0] - cx1, box[1] - cy1, box[2] - cx1, box[3] - cy1)
-
-    allowed = np.zeros((h, w), dtype=bool)
-    allowed[local[1]:local[3], local[0]:local[2]] = True
-    background = ~allowed
-    if background.any():
-        # Remove the crop-wide RGB cast introduced by diffusion before differencing.
-        shift = np.median(original[background] - edited[background], axis=0)
-    else:
-        shift = np.zeros(3, dtype=np.float32)
-    corrected = np.clip(edited + shift.reshape(1, 1, 3), 0, 255)
-    mask = (np.max(np.abs(corrected - original), axis=2) >= threshold) & allowed
-    for _ in range(DIFF_DILATION_PX):
-        padded = np.pad(mask, 1, mode="constant")
-        mask = np.logical_or.reduce([
-            padded[dy:dy+h, dx:dx+w]
-            for dy in range(3) for dx in range(3)
-        ]) & allowed
-
-    base = np.asarray(bg.convert("RGB"), dtype=np.uint8).copy()
-    crop_base = base[cy1:cy2, cx1:cx2]
-    crop_base[mask] = corrected.astype(np.uint8)[mask]
-    mask_image = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
-    return Image.fromarray(base, mode="RGB"), mask_image
+    patch = edited.crop(local)
+    feather = max(1, min(feather, (min(patch.size) - 1) // 2))
+    mask = Image.new("L", patch.size, 0)
+    ImageDraw.Draw(mask).rectangle((feather, feather, patch.width - feather - 1,
+                                    patch.height - feather - 1), fill=255)
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=feather))
+    bg.paste(patch, (box[0], box[1]), mask)
+    return bg
 
 
 def edit_region(editor, region_img, editor_prompt, seed):
@@ -613,6 +595,7 @@ def main():
         rejection_counts = {}
         blocked_checks = set()
         rejection_history = []
+        empty_plan_count = 0
         try:
             for round_idx in range(1, MAX_TEXT_ROUNDS + 1):
                 print(f"  [ROUND {round_idx}/{MAX_TEXT_ROUNDS}] Gemini 基于当前图重新规划")
@@ -633,9 +616,14 @@ def main():
                     print("  [STOP] Gemini 请求失败")
                     break
                 if len(edits) == 0:
-                    print("  [STOP] Gemini 判断当前图没有剩余 text 问题")
-                    break
+                    empty_plan_count += 1
+                    print(f"  [EMPTY PLAN] Gemini 第 {empty_plan_count}/{EMPTY_PLAN_CONFIRMATIONS} 次未发现剩余 text 问题")
+                    if empty_plan_count >= EMPTY_PLAN_CONFIRMATIONS:
+                        print("  [STOP] Gemini 连续两次未发现剩余 text 问题")
+                        break
+                    continue
 
+                empty_plan_count = 0
                 e = edits[0]
                 issue_key = f"{e['current_content']} -> {e['correct_content']}"
                 if issue_key in blocked_checks:
@@ -669,11 +657,8 @@ def main():
                 artifacts["model_output_crop"] = save_round_image(model_output, artifact_dir, "model_output_crop.png")
                 fixed = restore_crop_orientation(model_output.convert("RGB"), e["crop_rotation"])
                 artifacts["restored_output_crop"] = save_round_image(fixed, artifact_dir, "restored_output_crop.png")
-                candidate, difference_mask = paste_difference_mask(
-                    before.copy(), region, fixed.convert("RGB"), box, e["bbox"]
-                )
-                artifacts["difference_mask"] = save_round_image(
-                    difference_mask.convert("RGB"), artifact_dir, "difference_mask.png"
+                candidate = paste_light_feather(
+                    before.copy(), fixed.convert("RGB"), box, e["bbox"]
                 )
                 artifacts["candidate_full"] = save_round_image(candidate, artifact_dir, "candidate_full.png")
                 accepted, verify_info = verify_candidate(
