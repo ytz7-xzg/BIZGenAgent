@@ -64,9 +64,26 @@ class CleanCropContractTest(unittest.TestCase):
             source = (ROOT / "agent1" / f"{name}.py").read_text(encoding="utf-8")
             self.assertIn("PASTE_MARGIN_PX = 12", source)
             self.assertIn("def paste_hard_bbox", source)
-            self.assertIn("bg.paste(fg.crop(local)", source)
+            if name in ("text", "knowledge"):
+                self.assertIn("def paste_difference_mask", source)
+                self.assertIn("DIFF_THRESHOLD = 12", source)
+                self.assertIn('"difference_mask.png"', source)
+                self.assertIn("candidate, difference_mask = paste_difference_mask", source)
+            else:
+                self.assertIn("bg.paste(fg.crop(local)", source)
             for token in forbidden:
                 self.assertNotIn(token, source, f"{name}: {token}")
+
+    def test_all_dimensions_allow_twenty_five_rounds(self):
+        constants = {
+            "text": "MAX_TEXT_ROUNDS = 25",
+            "knowledge": "MAX_KNOWLEDGE_ROUNDS = 25",
+            "attribute": "MAX_ATTRIBUTE_ROUNDS = 25",
+            "layout": "MAX_LAYOUT_ROUNDS = 25",
+        }
+        for name, declaration in constants.items():
+            source = (ROOT / "agent1" / f"{name}.py").read_text(encoding="utf-8")
+            self.assertIn(declaration, source)
 
     def test_text_heavy_crops_have_reversible_orientation(self):
         for name in ("text", "knowledge"):

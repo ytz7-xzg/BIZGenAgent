@@ -14,6 +14,7 @@ Boogu-Turbo text 维度修复流水线（knowledge 版的结构化方法）
 """
 
 import os, io, json, re
+import numpy as np
 from datetime import datetime
 from PIL import Image
 from google import genai
@@ -27,7 +28,7 @@ SEED = 42
 SKIP_EXISTING = True
 TARGET_DIMENSION = "text"
 CLEAN_CROP_PROMPT_V3 = True
-MAX_TEXT_ROUNDS = 10
+MAX_TEXT_ROUNDS = 25
 MAX_REJECTIONS_PER_ISSUE = 3
 
 DATA_PATH = "/mmu-vcg/zb08/zixuan/BIZ/results/sample100/sample100.jsonl"
@@ -37,12 +38,14 @@ OUTPUT_DIR = os.environ.get("BIZ_OUTPUT_DIR", "/mmu-vcg/zb08/zixuan/BIZ/results/
 PLAN_DIR = os.environ.get("BIZ_PLAN_DIR", "/mmu-vcg/zb08/zixuan/BIZ/results/agent1_repair/plans/text")
 
 KEY_PATH = "/mmu-vcg/zb08/llm-6669-1b56d4a3712d.json"
-GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_MODEL = os.environ.get("BIZ_GEMINI_MODEL", "gemini-3.8-flash")
 
 REGION_PAD = 0.15       # bbox 自身宽高的外扩比例
 MAX_REGION_PAD = 0.05   # 单侧最多外扩全图 5%
 MIN_REGION_PAD_PX = 24  # 单侧至少保留 24px 上下文
 PASTE_MARGIN_PX = 12
+DIFF_THRESHOLD = 12
+DIFF_DILATION_PX = 1
 VERIFY_CONFIDENCE = 0.65
 # =========================================================
 
@@ -165,17 +168,19 @@ def gemini_crop_instruction(region_img, edit, retries=3):
 The incorrect visible text is: {edit['current_content']}
 The exact replacement text is: {edit['correct_content']}
 
-Write one concise, crop-local image-editing instruction.
+Write one complete natural-language image-editing instruction for this crop.
 Rules:
 - Identify the text only by characters or appearance visible in this crop.
 - Rewrite the target description using only crop-local visual evidence; do not copy full-image locators from planning context.
+- Describe the target precisely enough to distinguish it from every similar visible text element in the crop.
 - Prefer changing only the wrong word, character or number when the rest is already correct.
 - State the exact final text so the required characters are unambiguous.
 - Preserve font, weight, color, size, orientation, position, formulas and nearby content.
-- Explicitly name nearby visible text, symbols, lines, borders, and graphics that must remain fixed.
+- Explicitly name the actually visible nearby text, symbols, lines, borders, and graphics that must remain unchanged.
 - Treat every non-target crop element as fixed: do not redraw, move, blur, resize, duplicate, erase, or restyle it.
 - Do not mention bbox, coordinates, row/column numbers, ordering in the full image, or anything outside this crop.
 - Do not include analysis or grounding explanations.
+- Use a compact but sufficiently detailed paragraph; do not shorten the instruction by dropping target description or preservation details.
 - End with: Keep every other visible element unchanged.
 - Return STRICT JSON only: {{"instruction": "..."}}"""
 
@@ -409,6 +414,44 @@ def paste_hard_bbox(bg, fg, crop_box, bbox, margin=PASTE_MARGIN_PX):
     return bg
 
 
+def paste_difference_mask(bg, original_crop, edited_crop, crop_box, bbox,
+                          margin=PASTE_MARGIN_PX, threshold=DIFF_THRESHOLD):
+    """Paste semantic pixel changes only; preserve the original crop background."""
+    cx1, cy1, cx2, cy2 = crop_box
+    size = (cx2 - cx1, cy2 - cy1)
+    original = np.asarray(original_crop.resize(size, Image.Resampling.LANCZOS).convert("RGB"), dtype=np.float32)
+    edited = np.asarray(edited_crop.resize(size, Image.Resampling.LANCZOS).convert("RGB"), dtype=np.float32)
+    h, w = original.shape[:2]
+    W, H = bg.size
+    raw = (int(bbox[0] * W), int(bbox[1] * H), int(bbox[2] * W), int(bbox[3] * H))
+    box = (max(cx1, raw[0] - margin), max(cy1, raw[1] - margin),
+           min(cx2, raw[2] + margin), min(cy2, raw[3] + margin))
+    local = (box[0] - cx1, box[1] - cy1, box[2] - cx1, box[3] - cy1)
+
+    allowed = np.zeros((h, w), dtype=bool)
+    allowed[local[1]:local[3], local[0]:local[2]] = True
+    background = ~allowed
+    if background.any():
+        # Remove the crop-wide RGB cast introduced by diffusion before differencing.
+        shift = np.median(original[background] - edited[background], axis=0)
+    else:
+        shift = np.zeros(3, dtype=np.float32)
+    corrected = np.clip(edited + shift.reshape(1, 1, 3), 0, 255)
+    mask = (np.max(np.abs(corrected - original), axis=2) >= threshold) & allowed
+    for _ in range(DIFF_DILATION_PX):
+        padded = np.pad(mask, 1, mode="constant")
+        mask = np.logical_or.reduce([
+            padded[dy:dy+h, dx:dx+w]
+            for dy in range(3) for dx in range(3)
+        ]) & allowed
+
+    base = np.asarray(bg.convert("RGB"), dtype=np.uint8).copy()
+    crop_base = base[cy1:cy2, cx1:cx2]
+    crop_base[mask] = corrected.astype(np.uint8)[mask]
+    mask_image = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
+    return Image.fromarray(base, mode="RGB"), mask_image
+
+
 def edit_region(editor, region_img, editor_prompt, seed):
     return editor.edit(region_img, editor_prompt, seed)
 
@@ -498,6 +541,19 @@ def save_verification_json(fname, index, info):
     with open(verify_path, "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
     return verify_path
+
+
+def round_artifact_dir(fname, round_idx):
+    stem = os.path.splitext(os.path.basename(fname))[0]
+    path = os.path.join(PLAN_DIR, "intermediates", stem, f"round_{round_idx:02d}", "single")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def save_round_image(image, directory, name):
+    path = os.path.abspath(os.path.join(directory, name))
+    image.convert("RGB").save(path)
+    return path
 
 
 def main():
@@ -596,22 +652,41 @@ def main():
                     print(f"  [STOP] {ex}")
                     break
                 print(f"  [EDITOR PROMPT] {e['editor_prompt']}")
+                before = img.copy()
+                artifact_dir = round_artifact_dir(fname, round_idx)
+                artifacts = {
+                    "before_full": save_round_image(before, artifact_dir, "before_full.png"),
+                    "input_crop": save_round_image(editor_region, artifact_dir, "input_crop.png"),
+                }
+                e["artifact_dir"] = os.path.abspath(artifact_dir)
                 save_plan_json(
                     fname, it, img_path, save_path, failed, plan_info,
                     round_idx, e, len(edits), list(applied_history),
                 )
-                before = img.copy()
-                fixed = edit_region(
+                model_output = edit_region(
                     pipe, editor_region, e["editor_prompt"], SEED + i * 100 + round_idx
                 )
-                fixed = restore_crop_orientation(fixed.convert("RGB"), e["crop_rotation"])
-                candidate = paste_hard_bbox(
-                    before.copy(), fixed.convert("RGB"), box, e["bbox"]
+                artifacts["model_output_crop"] = save_round_image(model_output, artifact_dir, "model_output_crop.png")
+                fixed = restore_crop_orientation(model_output.convert("RGB"), e["crop_rotation"])
+                artifacts["restored_output_crop"] = save_round_image(fixed, artifact_dir, "restored_output_crop.png")
+                candidate, difference_mask = paste_difference_mask(
+                    before.copy(), region, fixed.convert("RGB"), box, e["bbox"]
                 )
+                artifacts["difference_mask"] = save_round_image(
+                    difference_mask.convert("RGB"), artifact_dir, "difference_mask.png"
+                )
+                artifacts["candidate_full"] = save_round_image(candidate, artifact_dir, "candidate_full.png")
                 accepted, verify_info = verify_candidate(
                     before, candidate, it.get("prompt", ""), e, failed
                 )
                 verify_info["editor_prompt"] = e["editor_prompt"]
+                verify_info["accepted"] = bool(accepted)
+                verify_info["artifact_dir"] = os.path.abspath(artifact_dir)
+                artifacts["committed_full" if accepted else "rollback_full"] = save_round_image(
+                    candidate if accepted else before, artifact_dir,
+                    "committed_full.png" if accepted else "rollback_full.png",
+                )
+                verify_info["artifacts"] = artifacts
                 verify_path = save_verification_json(fname, round_idx, verify_info)
                 print(f"  [VERIFY] {verify_info['status']} | {verify_path}")
                 if accepted:

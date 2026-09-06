@@ -36,7 +36,7 @@ SEED = 42
 SKIP_EXISTING = True
 TARGET_DIMENSION = "attribute"
 CLEAN_CROP_PROMPT_V3 = True
-MAX_ATTRIBUTE_ROUNDS = 10  # 每张图最多三轮，每轮只改一处
+MAX_ATTRIBUTE_ROUNDS = 25
 
 DATA_PATH = "/mmu-vcg/zb08/zixuan/BIZ/results/sample100/sample100.jsonl"
 IMG_DIR = "/mmu-vcg/zb08/zixuan/BIZ/results/sample100/originals"
@@ -45,7 +45,7 @@ OUTPUT_DIR = os.environ.get("BIZ_OUTPUT_DIR", "/mmu-vcg/zb08/zixuan/BIZ/results/
 PLAN_DIR = os.environ.get("BIZ_PLAN_DIR", "/mmu-vcg/zb08/zixuan/BIZ/results/agent1_repair/plans/attribute")
 
 KEY_PATH = "/mmu-vcg/zb08/llm-6669-1b56d4a3712d.json"
-GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_MODEL = os.environ.get("BIZ_GEMINI_MODEL", "gemini-3.8-flash")
 
 REGION_PAD = 0.15       # bbox 自身宽高的外扩比例
 MAX_REGION_PAD = 0.05   # 单侧最多外扩全图 5%
@@ -167,7 +167,7 @@ def gemini_crop_instruction(region_img, edit, retries=3):
     crop_bytes = image_to_bytes(region_img)
     prompt = f"""Inspect only the attached cropped image.
 
-Write one concise, crop-local image-editing instruction for the visible target whose current state is:
+Write one complete natural-language image-editing instruction for the visible target in this crop whose current state is:
 {edit['current_state']}
 
 Required final state:
@@ -176,13 +176,14 @@ Required final state:
 Rules:
 - Base the instruction only on visual content actually visible in this crop.
 - Rewrite all target descriptions into crop-local visual language; do not copy full-image locators from the planning context.
-- Identify the target with the shortest useful crop-local appearance cue.
+- Describe the target with enough crop-local visible cues to distinguish it from similar elements.
 - State exactly one editing action.
 - Explicitly preserve: {edit['preserve']}
-- Explicitly name every nearby visible text label, icon, border, accent, and layout edge that must remain fixed.
+- Explicitly name the actually visible nearby text labels, icons, borders, accents, and layout edges that must remain unchanged.
 - Treat all non-target crop content as fixed pixels: do not redraw, rewrite, move, blur, resize, duplicate, erase, or restyle it.
 - Do not mention bbox, coordinates, row/column numbers, ordering in the full image, or anything outside this crop.
 - Do not include analysis or grounding explanations.
+- Use a compact but sufficiently detailed paragraph; do not shorten the instruction by dropping target description or preservation details.
 - End with: Keep every other visible element unchanged.
 - Return STRICT JSON only: {{"instruction": "..."}}"""
 
@@ -507,6 +508,19 @@ def save_verification_json(fname, index, info):
     return verify_path
 
 
+def round_artifact_dir(fname, round_idx):
+    stem = os.path.splitext(os.path.basename(fname))[0]
+    path = os.path.join(PLAN_DIR, "intermediates", stem, f"round_{round_idx:02d}", "single")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def save_round_image(image, directory, name):
+    path = os.path.abspath(os.path.join(directory, name))
+    image.convert("RGB").save(path)
+    return path
+
+
 def main():
     # 1. 读数据集，只留 attribute 维度
     items = []
@@ -619,6 +633,13 @@ def main():
                     print(f"  [STOP] {ex}")
                     break
                 print(f"  [EDITOR PROMPT] {e['editor_prompt']}")
+                before = img.copy()
+                artifact_dir = round_artifact_dir(fname, round_idx)
+                artifacts = {
+                    "before_full": save_round_image(before, artifact_dir, "before_full.png"),
+                    "input_crop": save_round_image(region, artifact_dir, "input_crop.png"),
+                }
+                e["artifact_dir"] = os.path.abspath(artifact_dir)
                 save_plan_json(
                     fname, it, img_path, save_path, failed,
                     plan_info, round_idx, e, len(edits), list(applied_history),
@@ -630,14 +651,22 @@ def main():
                     e["editor_prompt"],
                     SEED + i * 100 + round_idx,
                 )
-                before = img.copy()
+                artifacts["model_output_crop"] = save_round_image(fixed, artifact_dir, "model_output_crop.png")
                 candidate = paste_hard_bbox(
                     before.copy(), fixed.convert("RGB"), box, e["bbox"]
                 )
+                artifacts["candidate_full"] = save_round_image(candidate, artifact_dir, "candidate_full.png")
                 accepted, verify_info = verify_candidate(
                     before, candidate, it.get("prompt", ""), e, failed
                 )
                 verify_info["editor_prompt"] = e["editor_prompt"]
+                verify_info["accepted"] = bool(accepted)
+                verify_info["artifact_dir"] = os.path.abspath(artifact_dir)
+                artifacts["committed_full" if accepted else "rollback_full"] = save_round_image(
+                    candidate if accepted else before, artifact_dir,
+                    "committed_full.png" if accepted else "rollback_full.png",
+                )
+                verify_info["artifacts"] = artifacts
                 verify_path = save_verification_json(fname, round_idx, verify_info)
                 print(f"  [VERIFY] {verify_info['status']} | {verify_path}")
                 if not accepted:
